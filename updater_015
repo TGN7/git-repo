@@ -1,0 +1,301 @@
+# -*- coding: utf-8 -*-
+# Обновление ПО 4.0--->4.1
+#    updater_015 v.1.5.0 (14:40 11.01.2019)
+# вынес часть функции в класс
+# при перезапуске ПО теперь обновляется здоровье вместо перезапуска загрузки патча
+'''
+<parameters>
+	<company></company>
+	<title>updater_type015</title>
+	<version>1.5 (14:40 11.01.2019)</version>
+</parameters>
+'''
+
+#имя для самоподписи
+script_name = 'updater_41'
+
+#USER_SETTINGS
+SCHEDULED_TIME = '' 	# Example: YYYY-MM-DD HH:MM:SS or empty to start immediately
+FREE_SPACE_LIMIT = 300  # minimum free disk space for patch in mbytes
+RETRY_COUNT = 5 		# number of retries to download 
+TIMEOUT_CHECK = 600 	# checking interval in seconds
+NEW_CLOUD_ADDRESS = 'https://site_new'	# if not empty - will setup new cloud_address
+
+# device_type01 data
+type01_url = 'https://site/static/downloads/device_type01_patch.pack' 			# http link
+type01_trigger_url = 'https://site/static/downloads/check-T4-1' 	# http link
+type01_version_range = '483-483' 	# example: 5520-5620
+
+# device_type02 data
+type02_url = 'https://site/static/downloads/device_type01_patch.pack' 			# http link
+type02_trigger_url = 'https://site/static/downloads/check-T4ds-1' 	# http link
+type02_version_range = '479-479' 	# example: 5520-5620
+
+# device_type03 data
+type03_url = '' 			# http link
+type03_trigger_url = '' 	# http link
+type03_version_range = '' 	# example: 5520-5620
+
+# Windows data
+win_url = 'https://site/static/downloads/windows_patch.pack' 			# http link
+win_trigger_url = 'https://site/static/downloads/check-windows' 	# http link
+win_version_range = '442-442' 	# example: 125100-125500
+
+# Windows client data
+# TODO: Путь к чексумме https://site/chechksum.md5
+client_url = 'https://site/static/downloads/client_patch.pack' 			# http link
+# TODO: what it means?
+client_trigger_url = 'https://site/static/downloads/check-client' 	# http link
+client_version_range = '611-611' 	# example: 125100-125500
+
+#END_USER_SETTINGS
+
+from urllib2 import urlopen
+from threading import Thread
+from datetime import datetime as dd
+import os, re, sys, time
+import shutil, hashlib, subprocess
+
+#узнаем тип устройства на котором запущен скрипт, заглядывая в servicepack_level в настройках health, device_guid уникален для каждого устройства
+servicepack_level = settings('health')['servicepack_level']
+device_guid = settings('').guid
+if   "type01" in servicepack_level:
+	server_type = "type01"
+elif "type02" in servicepack_level:
+	server_type = "type02"
+elif "type03" in servicepack_level:
+	server_type = "type03"
+elif "client" == device_guid:
+	server_type = "client"
+else:
+	server_type = "win"
+
+#
+VERSION_RANGE = eval("%s_version_range"%server_type)
+TRIGGER_URL = eval("%s_trigger_url"%server_type)
+PATCH_URL = eval("%s_url"%server_type)
+
+if not all([VERSION_RANGE, TRIGGER_URL, PATCH_URL]):
+	raise ValueError("Not all settings are present")
+
+# опрелеяем папку сохранения снимков, уже не актуально ранее она использовалась для сохранения загружаемых файлов 	
+ssfolder = (host.settings('system_wide_options')['screenshots_folder'] 
+		if server_type in ("win", "client") 
+		else '/home/os/shots' )
+
+# сюда загружаем файлы: патч и его чек сумма
+DOWNLOAD_PATH = os.path.abspath(os.path.join(ssfolder, 'downloadT4.pack'))
+READY_PATH = os.path.abspath(os.path.join(ssfolder, 'readyT4.pack'))
+	
+MD5FILE_PATH = DOWNLOAD_PATH.rsplit('.',1)[0] + '.md5'
+
+
+
+
+
+
+
+#добавил класс
+class Downloader:
+
+	patch_url = PATCH_URL
+	patch_file = DOWNLOAD_PATH
+	patch_file_ready = READY_PATH
+	md5_url = PATCH_URL.rsplit('.',1)[0] + '.md5'
+	md5_file = MD5FILE_PATH 
+	max_count = RETRY_COUNT
+
+	def __init__(self):
+		self.is_busy = False
+		self.download_patch = False
+		self.health = ''
+		self.count = 0
+	
+	def run(self):
+		self.is_busy = True
+		error = self.download_md5_file() # получение информации о файле..
+		error = self.download_patch_file() # загрузка патча
+		self.download_patch = False
+		if not error:
+			error = self.check_md5sum() # проверка загруженного файла...
+			error = self.truncate_file() # подготовка загруженного файла...
+			if not error:
+				shutil.move(self.patch_file, self.patch_file_ready)
+				self.health = '0:готово к обновлению' # обновляем здровье, перед обвнолением
+				self.is_busy = False
+				return
+		self.health = '2:' + error
+		self.is_busy = False
+		self.count += 1
+		try: 
+			os.remove(self.patch_file)
+		except: 
+			pass
+		if self.count > self.max_count:
+			self_erase()
+	#регулирем загрузку чек-суммы
+	def download_md5_file(self):
+		#Downloads md5 file, returns error message or None if success
+		self.health = '0:получение информации о файле..'
+		return self.download_file(self.md5_url, self.md5_file)
+	#регулируем загрузку патча
+	def download_patch_file(self):
+		#Downloads patch file, returns error message or None if success.
+		#As side effect, may change .download_patch to received self.patch_url Content-Length value
+		self.health = '0:загрузка патча'
+		return self.download_file(self.patch_url, self.patch_file)
+
+	def download_file(self, url, filename):
+		#Возвращает в здоровье сообщение об ошибке или нет, если успешно
+		self.health = '0:проверка загруженного файла...'
+		try:
+			response = urlopen(url)
+			size =  int(response.info().get('Content-Length'))
+			if filename.endswith('.pack'):
+				self.download_patch = size
+			with open(filename, 'wb') as f:
+				shutil.copyfileobj(response, f, 16*1024)
+			if not os.path.isfile(filename) or size != get_size(filename):
+				return 'Размер скачанного файла неверен. Попытка %s/%s'%(self.count, self.max_count)
+		except (urllib2.URLError, socket.error) as exc:
+			return 'Адрес недоступен\n%s' % exc
+		except (IOError, os.error, shutil.Error) as exc:
+			return 'Скачать не удалось. Попытка %s/%s\n%s'%(self.count, self.max_count, exc)
+
+	def check_md5sum(self):
+		#проверяем md5, возвращаем в здоровье сообщение об ошибке или нет, если успешно
+		self.health = '0:подготовка загруженного файла...'
+		hash_md5 = hashlib.md5()
+		with open(self.patch_file, 'rb') as f:
+			for chunk in iter(lambda: f.read(4096), b''):
+				hash_md5.update(chunk)
+		with open(self.md5_file) as f:
+			md5sum = f.read().split()[0]
+		if md5sum != hash_md5.hexdigest():
+			return 'Неверная контрольная сумма файла %s' % self.patch_file
+		
+	def truncate_file(self):
+		#Уменьшаем файл патча на 1024 байта, возвращает сообщение об ошибке или нет, если успешно
+		truncated_size = get_size(self.patch_file) - 1024
+		with open(self.patch_file, 'ab') as f:
+			f.truncate(truncated_size)
+		if get_size(self.patch_file) != truncated_size:
+			return 'Файл патча поломался при обрезке!'
+
+
+
+def get_size(file):
+	return int(os.path.getsize(file)) if os.path.isfile(file) else 0
+			
+def has_no_schedule_or_now_is_scheduled():
+	return not SCHEDULED_TIME or dd.strptime(SCHEDULED_TIME, '%Y-%m-%d %H:%M:%S') < dd.now()
+#вычисляем свободное пространсво под загрузку файлов		
+def check_free_space():
+	if server_type in ("win", "client"):
+		cmd = 'dir %s:'%(os.path.abspath('shots').split(':')[0])
+		data = subprocess.check_output(cmd,shell=True)
+		data = re.findall(r'(\d+)',data.split('\n')[-2])
+		free_space = int(''.join(data[1:]))/1024/1024
+	else:
+		cmd = 'df | grep LocalStorage | awk \'{{print $4}}\''
+		free_space = int(subprocess.check_output(cmd,shell=True))/1024
+	if free_space < FREE_SPACE_LIMIT:
+		raise ValueError('Not enough free space (%sMb)' % free_space)
+#проверяем доступность триггер файла, при его доступности распаковываем файлы патча и перезагружаем сервер
+def start_update_if_it_is_time_to():
+	try:
+		source = urlopen(TRIGGER_URL)
+	except:
+		return
+	if server_type in ("win", "client"):
+		shutil.move(READY_PATH, './software-update.7z')
+		reboot()
+	else:
+		shutil.move(READY_PATH, '/home/os/updates/software-update.tar.xz')
+		sys.exit(103)
+
+# проверяем версию после патча и записываем пустой параметр в здоровье, если все ОК. Устанавливаем новый адрес облака если он пустой и ребутаемся. Подчищаем за собой загруженные файлы и самоудаляем скрипт.
+def is_already_updated():
+	servicepack_number = re.findall(r'(\d+)', settings('health')['servicepack_level'])
+	if len (servicepack_number) ==1:
+		servicepack_number = servicepack_number [0]
+	elif len (servicepack_number) > 1:
+		servicepack_number = servicepack_number [1]
+	else:
+		raise Exception ('А-а-а!!! Какой номер у этой версии?')
+	start, end = VERSION_RANGE.split("-")
+	if int(start) <= int(servicepack_number) <= int(end):
+		update_health('')
+		if NEW_CLOUD_ADDRESS and settings("system_wide_options")["automatic_update_url"] != NEW_CLOUD_ADDRESS:
+			settings("system_wide_options")["automatic_update_url"] = NEW_CLOUD_ADDRESS
+			timeout(6*60*1000, reboot) 
+		else:
+			if os.path.isfile(MD5FILE_PATH): 
+				os.remove (MD5FILE_PATH) # удаление файла чек-суммы сломалось, с 1.3
+			if os.path.isfile(READY_PATH):
+				os.remove (READY_PATH)
+			self_erase()
+		return True
+
+def update_health(text):
+	label = 'обновление:'
+	text_health = '%s%s' % (label, text)
+	health = settings('health')['custom_indicators']
+	if not health:
+		new_health = text_health
+	elif health and not label in health:
+		new_health = '|'.join([text_health, health])
+	else:
+		new_health = '|'.join(
+			x if label not in x else text_health
+			for x in health.split('|') 
+				if x )
+	if new_health != health:
+		settings('health')['custom_indicators'] = new_health
+
+#перезагружаем сервер	
+def reboot():
+	sys.exit(102)
+	
+#самоудаляем скрипт	
+def self_erase():
+	settings("scripts")["script_erase"]= script_guid
+
+def watchdog():
+	#Периодически обновляет работоспособность, затем пытается начать загрузку или обновление
+	#health-update часть
+	if downloader.health:
+		health = downloader.health
+		if isinstance(downloader.download_patch, int) and downloader.download_patch > 0:
+			health += ' (%d%%)' % (100*float(get_size(DOWNLOAD_PATH))/float(downloader.download_patch))
+		update_health(health)
+
+	if not os.path.isfile(READY_PATH):
+		# patch-download часть: 
+		if has_no_schedule_or_now_is_scheduled():
+			if not downloader.is_busy:
+				Thread(target=downloader.run).start()
+	else:
+		# update часть: меняем имя файла патча в .7z/.XZ архив, ребутаем ПО
+		start_update_if_it_is_time_to()
+	
+	timeout(TIMEOUT_CHECK*1000, watchdog)
+
+
+
+#самоподписываем скрипт
+if host.stats().parent()['name'] != script_name:
+	host.stats().parent()['name'] = script_name
+#в случае перезагрузки сервера обновляем здоровье 
+else:
+	downloader = Downloader()
+	if os.path.isfile(MD5FILE_PATH) and os.path.isfile(READY_PATH) and not is_already_updated():
+		downloader.health = '0:готово к обновлению'
+		downloader.download_patch = True
+		watchdog()
+	else:
+		check_free_space()
+		if not is_already_updated():
+			watchdog()
+
+
